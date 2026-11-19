@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         灯塔-干部网络学院 连续播放（极简版）
 // @namespace    local.gbwlxy
-// @version      2.2
+// @version      2.3
 // @description  点进任意一门课，点「开始」，以 1.5 倍速播放；播完自动顺着页面下方的「课程推荐」继续播下一门；遇到随堂测试自动退出跳过。不跳进度、不伪造任何记录。
 // @match        https://gbwlxy.dtdjzx.gov.cn/*
 // @run-at       document-start
