@@ -1,0 +1,15 @@
+# 日志 / 临时文件
+*.log
+*.tmp
+
+# 截图（可能包含登录信息，切勿提交）
+*.png
+*.jpg
+*.jpeg
+browser-screenshots/
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
