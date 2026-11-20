@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         灯塔-干部网络学院 专栏播放列表
 // @namespace    local.gbwlxy
-// @version      3.5
+// @version      3.6
 // @description  拦截专栏页的课程接口生成播放列表，按顺序播放；1.5 倍速走平台控件；播完自动下一门；跳过随堂测试。
 // @match        https://gbwlxy.dtdjzx.gov.cn/*
 // @run-at       document-start
@@ -11,7 +11,7 @@
 (function () {
   'use strict';
 
-  const V = '3.5';
+  const V = '3.6';
   const KEY = 'gbwlxy_pl_v2';
   const RATE_KEY = 'gbwlxy_rate';
   const SS = window.sessionStorage;
@@ -295,12 +295,28 @@
   }
 
   // ================= 播放 =================
+  let navTarget = null, navArrivedAt = 0, navTries = 0;
+
+  function navigateTo(id) {
+    location.hash = `#/commend/coursedetail?courseId=${id}&flag=kc`;
+  }
+
   function openItem(i) {
     const it = st.items[i];
     if (!it) { st.running = false; save(); render(); return; }
     st.idx = i; save(); render();
     log(`→ ${i + 1}/${st.items.length} ${it.title}`);
-    location.hash = `#/commend/coursedetail?courseId=${it.id}&flag=kc`;
+
+    navTarget = it.id;
+    navTries = 0;
+    navArrivedAt = 0;
+    if (currentId() !== it.id) {
+      navigateTo(it.id);
+      // 平台播放器在结束/重载时也会改路由，再补一枪
+      setTimeout(() => { if (navTarget === it.id && currentId() !== it.id) navigateTo(it.id); }, 1600);
+    } else {
+      navArrivedAt = Date.now();
+    }
   }
 
   // 自动前进时跳过含测试的课（手动点击列表项不跳，尊重你的选择）
@@ -351,6 +367,27 @@
     }
     examHandled = false;
     if (pendingAdvance) { pendingAdvance = false; video = null; setTimeout(nextItem, 800); return; }
+
+    // 导航校验：跳过去之后要“稳住”一段时间；被平台自身跳转弹回去就重试
+    if (navTarget) {
+      if (currentId() === navTarget) {
+        if (!navArrivedAt) navArrivedAt = Date.now();
+        else if (Date.now() - navArrivedAt > 12000) { navTarget = null; navArrivedAt = 0; }   // 稳定 12 秒算成功
+      } else {
+        navArrivedAt = 0;
+        navTries++;
+        if (navTries % 2 === 1) {
+          log('⚠ 页面被弹回去了，重新导航到目标课程（第 ' + navTries + ' 次）');
+          navigateTo(navTarget);
+        }
+        if (navTries > 12) {
+          navTarget = null;
+          st.running = false; save(); render();
+          setMsg('跳转失败，已停止（把控制台日志发我）', '#c00');
+        }
+      }
+    }
+
     if (!onCoursePage()) return;
     attach();
     const v = video;
@@ -494,6 +531,13 @@
 
   function start() {
     buildPanel();
+    // 调试入口：控制台可用 __gbwlxy.openItem(n) / __gbwlxy.nextItem() 手动验证
+    window.__gbwlxy = {
+      openItem: (i) => openItem(i),
+      nextItem: () => nextItem(),
+      state: () => JSON.parse(JSON.stringify(st)),
+      nav: () => ({ target: navTarget, arrivedAt: navArrivedAt, tries: navTries, current: currentId() })
+    };
     if (st.running && onCoursePage()) { log('恢复运行，继续播放'); attach(); }
     let boot = 0;
     const t = setInterval(() => {
