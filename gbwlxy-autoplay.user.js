@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         灯塔-干部网络学院 连续播放（极简版）
+// @name         灯塔-干部网络学院 专栏播放列表
 // @namespace    local.gbwlxy
-// @version      2.3
-// @description  点进任意一门课，点「开始」，以 1.5 倍速播放；播完自动顺着页面下方的「课程推荐」继续播下一门；遇到随堂测试自动退出跳过。不跳进度、不伪造任何记录。
+// @version      3.0
+// @description  在专栏页收集全部课程生成播放列表，按顺序播放；1.5 倍速走平台自带控件；播完自动下一门；跳过随堂测试。
 // @match        https://gbwlxy.dtdjzx.gov.cn/*
 // @run-at       document-start
 // @grant        none
@@ -11,304 +11,408 @@
 (function () {
   'use strict';
 
-  const V = '2.3';
-  const KEY = 'gbwlxy_simple_running';
+  const V = '3.0';
+  const KEY = 'gbwlxy_pl_v1';        // 播放列表 + 运行状态
   const RATE_KEY = 'gbwlxy_rate';
-  const SS0 = window.sessionStorage;
+  const SS = window.sessionStorage;
+
+  const log = (...a) => { try { console.log('%c[播放列表]', 'color:#c00;font-weight:bold', '[v' + V + ']', ...a); } catch (e) {} };
+  const wait = (ms) => new Promise(r => setTimeout(r, ms));
+
+  const getSS = (k, d) => { try { const v = SS.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } };
+  const setSS = (k, v) => { try { SS.setItem(k, JSON.stringify(v)); } catch (e) {} };
+
+  // 状态：{ items:[{id?,title}], idx, running, columnHash, mode }
+  let st = getSS(KEY, { items: [], idx: -1, running: false, columnHash: '', mode: 'column' });
+  const save = () => setSS(KEY, st);
+
   const getRate = () => {
-    const n = Number((() => { try { return SS0.getItem(RATE_KEY); } catch (e) { return null; } })());
-    return [1, 1.25, 1.5, 2].includes(n) ? n : 1.5;   // 默认 1.5 倍速
+    const n = Number((() => { try { return SS.getItem(RATE_KEY); } catch (e) { return null; } })());
+    return [1, 1.25, 1.5].includes(n) ? n : 1.5;     // 平台上限 1.5，不给更高
   };
   let rate = getRate();
-  const log = (...a) => { try { console.log('%c[连续播放]', 'color:#c00;font-weight:bold', '[v' + V + ']', ...a); } catch (e) {} };
-
-  log('已注入', location.href);
-
-  // ---------- 运行状态 ----------
-  // 注意：这个站跳转到下一门课时会清空 localStorage，只有 sessionStorage 能留下来，
-  // 所以运行标记和"看过哪些课"必须存在 sessionStorage 里。
-  const SS = window.sessionStorage;
-  const isRunning = () => { try { return SS.getItem(KEY) === '1'; } catch (e) { return false; } };
-  const setRunning = (v) => { try { SS.setItem(KEY, v ? '1' : '0'); } catch (e) {} };
-
-  // ---------- 访问历史，防止在两门课之间来回跳 ----------
-  const HKEY = 'gbwlxy_visited';
-  const visited = () => { try { return JSON.parse(SS.getItem(HKEY)) || []; } catch (e) { return []; } };
-  const markVisited = (id) => {
-    const a = visited().filter(x => x !== id);
-    a.push(id);
-    try { SS.setItem(HKEY, JSON.stringify(a.slice(-40))); } catch (e) {}
-  };
 
   const currentId = () => { const m = location.hash.match(/courseId=(\d{10,25})/); return m ? m[1] : null; };
   const onCoursePage = () => !!currentId();
+  const onExamRoute = () => /\/examManage\//.test(location.hash);
   const currentTitle = () => {
-    const el = document.querySelector('.path') || document.querySelector('.course-detail-warp .path');
+    const el = document.querySelector('.path');
     return el ? (el.textContent || '').trim() : '';
   };
 
-  // ---------- 播放器 ----------
+  // ================= 采集 =================
+  function cardTitle(el) {
+    const t = el.querySelector('.top-title') || el.querySelector('.title') || el;
+    return (t.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 50);
+  }
+
+  function idFromHref(el) {
+    const pick = (n) => {
+      if (!n) return null;
+      if (n.matches && n.matches('a[href*="courseId="]')) {
+        const m = (n.getAttribute('href') || '').match(/courseId=(\d{10,25})/);
+        if (m) return m[1];
+      }
+      const a = n.querySelector ? n.querySelector('a[href*="courseId="]') : null;
+      if (a) {
+        const m = (a.getAttribute('href') || '').match(/courseId=(\d{10,25})/);
+        if (m) return m[1];
+      }
+      return null;
+    };
+    return pick(el) || pick(el.parentElement);
+  }
+
+  // 从卡片上的 Vue 实例里找课程 id（不同页面结构不同，尽力而为）
+  function idFromVue(el) {
+    let node = el;
+    for (let i = 0; i < 6 && node; i++) {
+      const vm = node.__vue__;
+      if (vm) {
+        const cands = [vm.$props && vm.$props.item, vm.$data && vm.$data.item, vm.item, vm.$data];
+        for (const c of cands) {
+          if (c && typeof c === 'object') {
+            const id = c.id || c.courseId;
+            if (id && /^\d{10,25}$/.test(String(id))) return String(id);
+          }
+        }
+      }
+      node = node.parentElement;
+    }
+    return null;
+  }
+
+  function scanCards() {
+    const cards = [...document.querySelectorAll('.course-list-item, .video-warp-start, [class*="course-item"]')]
+      .filter(e => e.offsetParent);
+    const out = [];
+    cards.forEach((el, i) => {
+      const title = cardTitle(el);
+      if (!title) return;
+      const id = idFromHref(el) || idFromVue(el);
+      out.push({ id: id || null, title, index: i });
+    });
+    return out;
+  }
+
+  function findPager() {
+    const sels = ['.el-pagination .btn-next', '.el-pagination button:last-of-type', '.btn-next', '[class*="pagination"] [class*="next"]'];
+    for (const s of sels) {
+      const b = document.querySelector(s);
+      if (!b) continue;
+      const cls = String(b.className || '');
+      if (b.disabled || /is-disabled|disabled/.test(cls)) continue;
+      const r = b.getBoundingClientRect();
+      if (r.width || r.height) return b;
+    }
+    return [...document.querySelectorAll('a,button,li,span,div')]
+      .find(e => e.offsetParent && /^(下一页|下页)$/.test((e.textContent || '').trim())) || null;
+  }
+
+  function mergeItems(dst, add) {
+    add.forEach(it => {
+      if (!it.title) return;
+      if (dst.some(x => x.title === it.title)) return;
+      dst.push(it);
+    });
+  }
+
+  async function collectAll() {
+    if (st.running) return log('先停止播放再收集');
+    log('开始采集当前专栏的课程…');
+    const items = [];
+    const columnHash = location.hash;
+    let pages = 0;
+
+    while (pages < 15) {
+      const found = scanCards();
+      const before = items.length;
+      mergeItems(items, found);
+      render();
+      log(`第 ${pages + 1} 页：本页 ${found.length} 门，累计 ${items.length} 门`);
+
+      const pager = findPager();
+      if (!pager || items.length === before) break;
+      pager.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      pages++;
+      await wait(2200);
+    }
+
+    if (!items.length) {
+      log('⚠ 没抓到课程。请在「专栏」详情页（能看到课程列表的那一页）点收集，然后用「诊断」把结果发我');
+      return;
+    }
+
+    const withId = items.filter(x => x.id).length;
+    st.items = items.map((x, i) => ({ id: x.id, title: x.title, index: i }));
+    st.idx = -1;
+    st.running = false;
+    st.columnHash = columnHash;
+    st.mode = 'column';
+    save();
+    render();
+    log(`✅ 采集完成：${items.length} 门（其中 ${withId} 门带课程ID）`);
+    if (!withId) log('注意：这些课程没抓到 ID，播放时靠返回本页按顺序点击');
+  }
+
+  // ================= 播放控制 =================
   let video = null;
 
-  function findVideo() {
-    return document.querySelector('video.vjs-tech') || document.querySelector('video');
+  const findVideo = () => document.querySelector('video.vjs-tech') || document.querySelector('video');
+
+  // 倍速：优先用平台自己的速度控件，避免被判“倍速过快”
+  let speedViaUI = false;
+  function applySpeed() {
+    const v = video;
+    if (!v) return;
+    if (Math.abs(v.playbackRate - rate) < 0.01) return;
+
+    // 1) 试平台自带菜单
+    try {
+      const btn = document.querySelector('.vjs-playback-rate');
+      if (btn) {
+        btn.click();
+        const menus = [...document.querySelectorAll('.vjs-menu-item')].filter(e => e.offsetParent);
+        const target = menus.find(e => new RegExp('^' + rate + '(x|×|倍速)?$').test((e.textContent || '').trim()));
+        if (target) {
+          target.click();
+          speedViaUI = true;
+          log('已通过平台控件设置为', rate + 'x');
+          setTimeout(() => { if (video && Math.abs(video.playbackRate - rate) > 0.01) { video.playbackRate = rate; } }, 300);
+          return;
+        }
+        btn.click();  // 关掉菜单
+      }
+    } catch (e) {}
+
+    // 2) 回退：直接设置
+    try { v.playbackRate = rate; } catch (e) {}
   }
 
   function playNow(v) {
-    try { v.muted = true; v.playbackRate = rate; } catch (e) {}
+    try { v.muted = true; } catch (e) {}
+    applySpeed();
     return v.play().catch(() => {});
-  }
-
-  // 平台播放器有时会自己把倍速重置回 1，这里持续校正
-  function enforceRate() {
-    const v = video;
-    if (!v) return;
-    try {
-      if (Math.abs(v.playbackRate - rate) > 0.01) {
-        v.playbackRate = rate;
-        log('倍速已被平台重置，重新设为', rate + 'x');
-      }
-    } catch (e) {}
   }
 
   function attach() {
     const v = findVideo();
-    if (!v) return;
-    if (v === video) return;
+    if (!v || v === video) return;
     video = v;
     v.addEventListener('ended', onEnded);
     v.addEventListener('pause', onPause);
+    v.addEventListener('ratechange', () => {
+      // 平台把倍速改回 1 时再校正一次（但不与平台来回抢）
+      if (st.running && Math.abs(v.playbackRate - rate) > 0.05 && v.playbackRate === 1) {
+        setTimeout(() => applySpeed(), 1200);
+      }
+    });
     log('接管播放器，时长', Math.round(v.duration || 0), '秒');
-    if (isRunning()) playNow(v);
+    if (st.running) playNow(v);
   }
 
   function onPause() {
     const v = video;
-    if (!v || v.ended || !isRunning()) return;
+    if (!v || v.ended || !st.running) return;
     const t = v.currentTime;
     setTimeout(() => {
-      if (video !== v || v.ended || !isRunning()) return;
+      if (video !== v || v.ended || !st.running) return;
       if (v.paused && Math.abs(v.currentTime - t) < 0.3) playNow(v);
     }, 2500);
   }
 
-  // ---------- 随堂测试页：直接退出跳过（不答题） ----------
-  function onExamRoute() { return /\/examManage\//.test(location.hash); }
+  // ================= 打开第 n 门 =================
+  async function openItem(i) {
+    const it = st.items[i];
+    if (!it) { log('播放列表已到末尾'); st.running = false; save(); render(); return; }
+    st.idx = i;
+    save();
+    render();
 
-  function skipExam() {
-    const b = document.querySelector('button.exitBtn')
-      || [...document.querySelectorAll('button, .el-button')].find(x => /^退\s*出$/.test((x.textContent || '').trim()));
-    if (b) {
-      b.click();
-      log('⚠ 进入随堂测试页，已退出跳过（本门不计学时）');
-      return true;
-    }
-    return false;
-  }
-
-  // ---------- 随堂测试弹窗：只关闭，不答题 ----------
-  function closeQuiz() {
-    const boxes = [...document.querySelectorAll('.el-dialog, .el-message-box, .el-dialog__wrapper, [class*="dialog"][class*="quiz"], [class*="exam"]')]
-      .filter(d => d.offsetParent && /随堂|答题|作答|测试|考试/.test(d.innerText || ''));
-    for (const d of boxes) {
-      const cand = [...d.querySelectorAll('button, .el-button, .el-dialog__headerbtn, i[class*="close"], span[class*="close"]')]
-        .find(b => /关闭|取消|稍后|退出|×|close/i.test((b.textContent || '') + ' ' + (b.className || '')));
-      if (cand) {
-        cand.click();
-        log('⚠ 检测到随堂测试弹窗，已关闭（不答题，本门不计学时）');
-        return true;
-      }
-    }
-    return false;
-  }
-
-  // ---------- 播完：顺着「课程推荐」播下一门 ----------
-  function cardTitle(el) {
-    const t = el.querySelector('.top-title') || el.querySelector('.title') || el;
-    return (t.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40);
-  }
-
-  function clickRefresh() {
-    const b = [...document.querySelectorAll('button, a, span, div')]
-      .find(e => e.offsetParent && /^换一换$/.test((e.textContent || '').trim()));
-    if (b) { b.click(); log('推荐列表已刷新'); return true; }
-    return false;
-  }
-
-  async function nextCourse() {
-    if (!isRunning()) return;
-    const wait = (ms) => new Promise(r => setTimeout(r, ms));
-    const cur = currentTitle();
-    const seen = visited();
-
-    const getCards = () => [...document.querySelectorAll('.course-list-item')].filter(e => e.offsetParent);
-    const pick = () => getCards().find(c => {
-      const t = cardTitle(c);
-      return t && t !== cur && !seen.some(s => t.includes(s));
-    });
-
-    // 播完后播放器会重置、推荐列表要重新渲染，这里最多等 15 秒
-    let target = null;
-    for (let i = 0; i < 15 && !target; i++) {
-      target = pick();
-      if (!target) await wait(1000);
-    }
-
-    if (!target && clickRefresh()) {          // 推荐都看过了就换一换
-      await wait(3000);
-      target = pick();
-    }
-
-    if (!target) {
-      const n = getCards().length;
-      log(n ? '推荐里的课都看过了，停止' : '页面上没有推荐课程，停止');
-      setRunning(false); render();
+    if (it.id) {
+      log(`→ 第 ${i + 1}/${st.items.length} 门：${it.title}`);
+      location.hash = `#/commend/coursedetail?courseId=${it.id}&flag=kc`;
       return;
     }
 
-    log('→ 下一门：', cardTitle(target));
-    markVisited(cardTitle(target));
-    video = null;                             // 让新页面重新接管
-    target.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    // 没有 ID：回到专栏页，按顺序点第 i 张卡片
+    log(`→ 第 ${i + 1}/${st.items.length} 门（按序号点击）：${it.title}`);
+    if (location.hash !== st.columnHash) {
+      location.hash = st.columnHash;
+      await wait(3000);
+    }
+    for (let k = 0; k < 12; k++) {
+      const cards = [...document.querySelectorAll('.course-list-item, .video-warp-start, [class*="course-item"]')].filter(e => e.offsetParent);
+      if (cards.length > i) {
+        cards[i].dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        return;
+      }
+      await wait(1000);
+    }
+    log('⚠ 回到专栏页后没找到第 ' + (i + 1) + ' 张卡片，停止');
+    st.running = false; save(); render();
   }
 
-  let endedOnce = false, pendingAdvance = false;
+  function nextItem() {
+    if (!st.running) return;
+    if (st.idx + 1 >= st.items.length) {
+      log('🎉 播放列表全部完成');
+      st.running = false; save(); render(); return;
+    }
+    openItem(st.idx + 1);
+  }
+
+  // ================= 结束 / 考试页 =================
+  let endedOnce = false, pendingAdvance = false, examHandled = false;
 
   function onEnded() {
     if (endedOnce) return;
     endedOnce = true;
-    log('本门播放结束');
-    markVisited(currentTitle());
-    closeQuiz();
-    // 平台对“有随堂测试”的课会自动跳到考试页，等它跳完再决定下一步
+    log('本门结束');
     setTimeout(() => {
-      if (onExamRoute()) {
-        if (skipExam()) pendingAdvance = true;
-      } else {
-        pendingAdvance = true;
-      }
+      if (onExamRoute()) { examHandled = true; skipExam(); }
+      pendingAdvance = true;
       endedOnce = false;
     }, 2500);
   }
 
-  // ---------- 看门狗：考试页 / 卡住 / 弹窗 / 被暂停 ----------
-  let lastTime = -1, stuckCount = 0, examHandled = false;
-  setInterval(() => {
-    if (!isRunning()) return;
+  function skipExam() {
+    const b = document.querySelector('button.exitBtn')
+      || [...document.querySelectorAll('button, .el-button')].find(x => /^退\s*出$/.test((x.textContent || '').trim()));
+    if (b) { b.click(); log('⚠ 随堂测试页，已退出跳过（该门不计学时）'); return true; }
+    return false;
+  }
 
-    // 1) 在随堂测试页 → 退出，然后推进到下一门
+  // ================= 看门狗 =================
+  setInterval(() => {
+    if (!st.running) return;
+
     if (onExamRoute()) {
-      if (!examHandled) { examHandled = true; if (skipExam()) pendingAdvance = true; }
+      if (!examHandled) { examHandled = true; skipExam(); pendingAdvance = true; }
       render();
       return;
     }
     examHandled = false;
 
-    if (!onCoursePage()) return;
-
-    // 2) 播完（或刚退出考试页）→ 切下一门
     if (pendingAdvance) {
       pendingAdvance = false;
       video = null;
-      setTimeout(nextCourse, 800);
+      setTimeout(nextItem, 800);
       render();
       return;
     }
 
+    if (!onCoursePage()) return;
     attach();
     const v = video;
     if (!v) return;
-    enforceRate();
-
-    if (closeQuiz()) setTimeout(() => playNow(v), 800);
     if (v.paused && !v.ended) playNow(v);
+  }, 4000);
 
-    if (!v.paused) {
-      if (Math.abs(v.currentTime - lastTime) < 0.4) stuckCount++; else stuckCount = 0;
-      lastTime = v.currentTime;
-      if (stuckCount >= 8) {           // 约 40 秒没动，判定卡死
-        log('⚠ 播放长时间不推进，跳到下一门');
-        stuckCount = 0;
-        pendingAdvance = true;
-      }
-    }
-  }, 5000);
-
-  // ---------- 悬浮面板 ----------
+  // ================= 面板 =================
   let panel = null;
+
   function render() {
     if (!panel) return;
-    const v = video;
-    const st = isRunning() ? '运行中' : '已停止';
-    const prog = v && v.duration ? ` ｜${Math.round(v.currentTime)}/${Math.round(v.duration)}s` : '';
-    const spd = isRunning() ? ` ｜${rate}x` : '';
-    panel.querySelector('.s-info').textContent = st + prog + spd;
-    panel.querySelector('.s-btn').textContent = isRunning() ? '停止' : '开始';
+    const cur = st.items[st.idx];
+    panel.querySelector('.p-status').textContent =
+      `${st.items.length ? st.items.length + ' 门' : '空列表'} ｜${st.running ? '播放中' : '已停止'}` +
+      (cur ? ` ｜${st.idx + 1}. ${cur.title.slice(0, 14)}` : '') +
+      (rate ? ` ｜${rate}x` : '');
+    panel.querySelector('.p-start').textContent = st.running ? '停止' : '开始';
+    const box = panel.querySelector('.p-list');
+    box.innerHTML = '';
+    st.items.forEach((it, i) => {
+      const row = document.createElement('div');
+      row.textContent = (i === st.idx ? '▶ ' : '　') + (i + 1) + '. ' + it.title;
+      row.style.cssText = 'padding:2px 4px;cursor:pointer;border-radius:3px;' +
+        (i === st.idx ? 'background:#ffe8e8;color:#c00;font-weight:600;' : 'color:#333;');
+      row.onclick = () => { if (!st.running) { st.running = true; save(); } openItem(i); };
+      box.appendChild(row);
+    });
+  }
+
+  function diag() {
+    const cards = scanCards();
+    const sample = cards.slice(0, 3).map(c => ({ title: c.title, id: c.id, index: c.index }));
+    const out = {
+      url: location.hash,
+      cardCount: cards.length,
+      cardsWithId: cards.filter(c => c.id).length,
+      sample,
+      pager: !!findPager(),
+      anchorsWithCourseId: document.querySelectorAll('a[href*="courseId="]').length,
+      rateControl: !!document.querySelector('.vjs-playback-rate'),
+      rateMenuItems: [...document.querySelectorAll('.vjs-menu-item')].map(e => (e.textContent || '').trim()).slice(0, 10),
+      currentRate: video ? video.playbackRate : null,
+      warnings: [...document.querySelectorAll('*')].filter(e => e.offsetParent && e.children.length === 0 && /倍速|过快|异常/.test(e.textContent || '')).map(e => e.textContent.trim()).slice(0, 5)
+    };
+    console.log('[播放列表] 诊断', out);
+    log('诊断结果已打印（右键复制 JSON 发我）');
+    return out;
   }
 
   function buildPanel() {
     if (panel) return;
-    try {
-      panel = document.createElement('div');
-      panel.id = 'gbwlxy-simple-panel';
-      panel.style.cssText = 'position:fixed;right:14px;bottom:14px;z-index:2147483000;background:#fff;border:1px solid #c00;border-radius:6px;padding:8px 10px;font:12px/1.7 system-ui;color:#222;box-shadow:0 2px 10px rgba(0,0,0,.2)';
-      panel.innerHTML =
-        '<div style="font-weight:700;color:#c00">连续播放 v' + V + '</div>' +
-        '<div class="s-info" style="color:#555;margin:2px 0 6px">已停止</div>' +
-        '<button class="s-btn">开始</button>' +
-        '<button class="s-reset" style="margin-left:6px" title="清空已看记录">重置记录</button>' +
-        '<div style="margin-top:6px">倍速 <select class="s-rate">' +
-        [1, 1.25, 1.5, 2].map(r => '<option value="' + r + '"' + (r === rate ? ' selected' : '') + '>' + r + 'x</option>').join('') +
-        '</select></div>';
-      (document.body || document.documentElement).appendChild(panel);
+    panel = document.createElement('div');
+    panel.id = 'gbwlxy-pl-panel';
+    panel.style.cssText = 'position:fixed;right:14px;bottom:14px;z-index:2147483000;width:320px;background:#fff;border:1px solid #c00;border-radius:6px;padding:8px 10px;font:12px/1.6 system-ui;color:#222;box-shadow:0 2px 12px rgba(0,0,0,.22)';
+    panel.innerHTML =
+      '<div style="font-weight:700;color:#c00">专栏播放列表 v' + V + '</div>' +
+      '<div class="p-status" style="color:#555;margin:2px 0 6px">空列表</div>' +
+      '<div>' +
+      '<button class="p-collect">收集本专栏</button>' +
+      '<button class="p-start" style="margin-left:6px">开始</button>' +
+      '<button class="p-diag" style="margin-left:6px" title="打印诊断信息">诊断</button>' +
+      '</div>' +
+      '<div style="margin-top:6px">倍速 <select class="p-rate">' +
+      [1, 1.25, 1.5].map(r => '<option value="' + r + '"' + (r === rate ? ' selected' : '') + '>' + r + 'x</option>').join('') +
+      '</select><button class="p-clear" style="margin-left:6px">清空</button></div>' +
+      '<div class="p-list" style="max-height:180px;overflow:auto;border-top:1px solid #eee;margin-top:6px;padding-top:4px"></div>';
+    (document.body || document.documentElement).appendChild(panel);
 
-      panel.querySelector('.s-btn').onclick = () => {
-        setRunning(!isRunning());
-        if (isRunning()) {
-          log('开始');
-          attach();
-          if (video) playNow(video);
-          else setTimeout(() => { attach(); if (video) playNow(video); }, 1500);
-        } else log('停止');
-        render();
-      };
-      panel.querySelector('.s-reset').onclick = () => {
-        try { SS.removeItem(HKEY); } catch (e) {}
-        log('已清空“看过的课程”记录');
-      };
-
-      panel.querySelector('.s-rate').onchange = (e) => {
-        rate = Number(e.target.value);
-        try { SS.setItem(RATE_KEY, String(rate)); } catch (err) {}
-        enforceRate();
-        if (video && isRunning()) playNow(video);
-        log('倍速设为', rate + 'x');
-        render();
-      };
-
+    panel.querySelector('.p-collect').onclick = () => collectAll();
+    panel.querySelector('.p-start').onclick = () => {
+      st.running = !st.running;
+      save(); render();
+      if (st.running) {
+        if (st.idx < 0) openItem(0);
+        else if (video) playNow(video);
+        else attach();
+      }
+      log(st.running ? '开始' : '停止');
+    };
+    panel.querySelector('.p-diag').onclick = diag;
+    panel.querySelector('.p-rate').onchange = (e) => {
+      rate = Number(e.target.value);
+      try { SS.setItem(RATE_KEY, String(rate)); } catch (err) {}
+      applySpeed();
+      log('倍速设为', rate + 'x');
       render();
-      log('面板已创建');
-    } catch (e) { log('面板创建失败:', e.message); }
+    };
+    panel.querySelector('.p-clear').onclick = () => {
+      st = { items: [], idx: -1, running: false, columnHash: '', mode: 'column' };
+      save(); render();
+    };
+    render();
+    log('面板已创建');
   }
 
-  // ---------- 启动 ----------
+  // ================= 启动 =================
   function start() {
     buildPanel();
-    if (onCoursePage() && isRunning()) {
-      log('恢复上次的运行状态，继续播放');
+    if (st.running && onCoursePage()) {
+      log('恢复运行状态，继续播放');
       attach();
     }
-    // 跳下一门是整页刷新，播放器要过一会儿才初始化好，这里前 40 秒每秒试着起播
     let bootTries = 0;
     const boot = setInterval(() => {
-      if (!isRunning() || pendingAdvance || onExamRoute()) return;
+      if (!st.running || pendingAdvance || onExamRoute()) return;
       attach();
       const v = video;
-      enforceRate();
       if (v && v.paused && !v.ended && v.readyState >= 2) playNow(v);
-      if (++bootTries > 40) clearInterval(boot);
+      if (++bootTries > 60) clearInterval(boot);
     }, 1000);
-
     setInterval(render, 2000);
     window.addEventListener('hashchange', () => { video = null; setTimeout(attach, 1200); });
   }
