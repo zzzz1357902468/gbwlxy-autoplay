@@ -1,7 +1,7 @@
-// ==UserScript==
+﻿// ==UserScript==
 // @name         灯塔-干部网络学院 专栏播放列表
 // @namespace    local.gbwlxy
-// @version      3.7
+// @version      3.8
 // @description  拦截专栏页的课程接口生成播放列表，按顺序播放；1.5 倍速走平台控件；播完自动下一门；跳过随堂测试。
 // @match        https://gbwlxy.dtdjzx.gov.cn/*
 // @run-at       document-start
@@ -11,7 +11,7 @@
 (function () {
   'use strict';
 
-  const V = '3.7';
+  const V = '3.8';
   const KEY = 'gbwlxy_pl_v2';
   const RATE_KEY = 'gbwlxy_rate';
   const SS = window.sessionStorage;
@@ -312,8 +312,27 @@
   const FIX_KEY = 'gbwlxy_fix';
   let lastNavAt = 0;
 
+  // 真正的整页跳转：加一个时间戳查询参数，强制浏览器重新加载目标课程
   function navigateTo(id) {
-    location.hash = `#/commend/coursedetail?courseId=${id}&flag=kc`;
+    const base = location.href.split('#')[0].split('?')[0];
+    const url = base + '?r=' + Date.now() + '#/commend/coursedetail?courseId=' + id + '&flag=kc';
+    log('整页跳转到：', url.slice(-70));
+    try { location.replace(url); } catch (e) { location.hash = `#/commend/coursedetail?courseId=${id}&flag=kc`; }
+  }
+
+  const pageTitle = () => {
+    const el = document.querySelector('.path');
+    return el ? (el.textContent || '').replace(/\s+/g, '').trim() : '';
+  };
+
+  // 到达判定：URL 对上还不够，标题也必须对上（避免“hash 改了但页面没换”）
+  function arrivedAt(id) {
+    if (currentId() !== id) return false;
+    const want = ((st.items.find(x => x.id === id) || {}).title || '').replace(/\s+/g, '');
+    const have = pageTitle();
+    if (!want || !have) return true;                 // 拿不到标题，退回看 URL
+    const a = want.slice(0, 10), b = have.slice(0, 10);
+    return have.includes(a) || want.includes(b);
   }
 
   function bumpFix(id) {
@@ -328,12 +347,19 @@
   function ensureOnTarget(force) {
     const want = st.expect;
     if (!want || !st.running) return;
-    if (currentId() === want) {
-      st.expect = null; st.expectAt = 0; save();
-      setSS(FIX_KEY, { id: '', n: 0 });
-      log('✅ 已到达目标课程', String(st.idx + 1));
+
+    if (arrivedAt(want)) {
+      // 到达后要“稳住”15 秒才算成功，防止平台过一会儿又把页面换掉
+      if (!st.okAt) { st.okAt = Date.now(); save(); }
+      else if (Date.now() - st.okAt > 15000) {
+        st.expect = null; st.okAt = 0; save();
+        setSS(FIX_KEY, { id: '', n: 0 });
+        log('✅ 目标课程已稳定 15 秒', String(st.idx + 1));
+      }
       return;
     }
+
+    st.okAt = 0; save();
     if (!force && Date.now() - lastNavAt < 5000) return;
     const n = bumpFix(want);
     if (n > 10) {
@@ -343,7 +369,7 @@
       return;
     }
     lastNavAt = Date.now();
-    log(`→ 校正导航到目标课程（第 ${n} 次）`);
+    log(`→ 校正导航（第 ${n} 次）｜URL课程=${currentId()} 页面标题="${pageTitle().slice(0, 14)}" 目标="${((st.items.find(x => x.id === want) || {}).title || '').slice(0, 14)}"`);
     navigateTo(want);
   }
 
@@ -353,16 +379,12 @@
     st.idx = i;
     st.expect = it.id;
     st.expectAt = Date.now();
+    st.okAt = 0;
     save(); render();
     log(`→ ${i + 1}/${st.items.length} ${it.title}`);
 
-    if (currentId() === it.id) {
-      st.expect = null; save();
-      return;
-    }
-    navigateTo(it.id);
-    // 补一枪：平台在结束时也会改路由，避免被它覆盖
-    setTimeout(() => { if (st.expect === it.id && currentId() !== it.id) navigateTo(it.id); }, 1600);
+    if (arrivedAt(it.id)) { return; }   // 已经在这门课上
+    navigateTo(it.id);                  // 整页加载目标课程
   }
 
   // 自动前进时跳过含测试的课（手动点击列表项不跳，尊重你的选择）
@@ -567,17 +589,12 @@
       openItem: (i) => openItem(i),
       nextItem: () => nextItem(),
       state: () => JSON.parse(JSON.stringify(st)),
-      nav: () => ({ expect: st.expect, idx: st.idx, current: currentId(), fix: getSS('gbwlxy_fix', null) })
+      nav: () => ({ expect: st.expect, idx: st.idx, current: currentId(), title: pageTitle(), arrived: st.expect ? arrivedAt(st.expect) : null, fix: getSS('gbwlxy_fix', null) })
     };
-    // 平台播完可能整页刷新回原课程，这里开机就检查是否跑错了页
+    // 平台播完可能整页刷新回原课程：开机先按“URL + 页面标题”双重校验
     if (st.running) {
-      if (st.expect && currentId() !== st.expect) {
-        log('⚠ 页面课程与播放列表不一致（可能被平台刷新回原课），开始校正到第', st.idx + 1, '项');
-        setTimeout(() => ensureOnTarget(true), 600);
-      } else if (onCoursePage()) {
-        log('恢复运行，继续播放');
-        attach();
-      }
+      if (st.expect) setTimeout(() => ensureOnTarget(true), 2000);
+      if (onCoursePage()) { log('恢复运行，继续播放'); attach(); }
     }
     let boot = 0;
     const t = setInterval(() => {
