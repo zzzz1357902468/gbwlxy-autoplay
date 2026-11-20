@@ -1,7 +1,7 @@
-// ==UserScript==
+﻿// ==UserScript==
 // @name         灯塔-干部网络学院 专栏播放列表
 // @namespace    local.gbwlxy
-// @version      3.2
+// @version      3.3
 // @description  拦截专栏页的课程接口生成播放列表，按顺序播放；1.5 倍速走平台控件；播完自动下一门；跳过随堂测试。
 // @match        https://gbwlxy.dtdjzx.gov.cn/*
 // @run-at       document-start
@@ -11,7 +11,7 @@
 (function () {
   'use strict';
 
-  const V = '3.2';
+  const V = '3.3';
   const KEY = 'gbwlxy_pl_v2';
   const RATE_KEY = 'gbwlxy_rate';
   const SS = window.sessionStorage;
@@ -35,12 +35,52 @@
   const onExamRoute = () => /\/examManage\//.test(location.hash);
 
   // ================= 接口响应嗅探 =================
-  const netLog = [];               // { url, json }
+  const netLog = [];               // 最近响应，仅用于诊断
   const NET_MAX = 60;
 
-  function pushNet(url, json) {
+  // 课程库：一旦在响应里识别到课程就立刻存下来，不参与淘汰，并按来源/专栏分组
+  const courseMap = new Map();     // id -> { id, title, ch, test, src, col, seq }
+  let seq = 0;
+
+  function pushNet(url, json, body) {
     if (netLog.length >= NET_MAX) netLog.shift();
     netLog.push({ url: String(url || '').slice(-100), json: json });
+    indexJSON(url, json, body);
+  }
+
+  // 从请求体里取专栏 id（/subject/queryCourse 的 payload 带 subjectId）
+  function columnIdFromBody(body) {
+    try {
+      const o = typeof body === 'string' ? JSON.parse(body) : body;
+      if (o && typeof o === 'object') {
+        const v = o.subjectId || o.subjectCode || o.specialId;
+        if (v && /^\d{6,25}$/.test(String(v))) return String(v);
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  function indexJSON(url, json, body) {
+    const found = [];
+    walk(json, found, 0);
+    if (!found.length) return;
+    const src = String(url || '');
+    const col = columnIdFromBody(body);
+    for (const c of found) {
+      const id = String(c.id || c.courseId);
+      if (courseMap.has(id)) continue;
+      const hasTest = (c.assessementType !== undefined && c.assessementType !== null && String(c.assessementType) !== '1')
+        || (c.examFlag === '0');
+      courseMap.set(id, {
+        id,
+        title: String(c.name || c.courseName || c.title).trim().slice(0, 60),
+        ch: Number(c.creditHour) || 0,
+        test: hasTest,
+        src: src.slice(-70),
+        col: col || null,
+        seq: seq++
+      });
+    }
   }
 
   try {
@@ -49,7 +89,7 @@
       return of.apply(this, a).then(function (r) {
         try {
           const ct = r.headers.get('content-type') || '';
-          if (/json/i.test(ct)) r.clone().json().then(j => pushNet(a[0], j)).catch(function () {});
+          if (/json/i.test(ct)) r.clone().json().then(j => pushNet(a[0], j, a[1] && a[1].body)).catch(function () {});
         } catch (e) {}
         return r;
       });
@@ -60,10 +100,11 @@
     const oo = XMLHttpRequest.prototype.open, os = XMLHttpRequest.prototype.send;
     XMLHttpRequest.prototype.open = function (m, u, ...r) { this.__u = u; return oo.call(this, m, u, ...r); };
     XMLHttpRequest.prototype.send = function (...a) {
+      this.__b = a[0];
       this.addEventListener('load', function () {
         try {
           const t = this.responseText;
-          if (t && t.length < 3000000 && /^[\[{]/.test(t.trim())) pushNet(this.__u, JSON.parse(t));
+          if (t && t.length < 3000000 && /^[\[{]/.test(t.trim())) pushNet(this.__u, JSON.parse(t), this.__b);
         } catch (e) {}
       });
       return os.apply(this, a);
@@ -88,27 +129,22 @@
     for (const k in node) walk(node[k], out, depth + 1);
   }
 
-  function harvestAll() {
-    const out = [];
-    const seen = new Set();
-    for (const rec of netLog) {
-      const found = [];
-      walk(rec.json, found, 0);
-      for (const c of found) {
-        const id = String(c.id || c.courseId);
-        if (seen.has(id)) continue;
-        seen.add(id);
-        const hasTest = (c.assessementType !== undefined && c.assessementType !== null && String(c.assessementType) !== '1')
-          || (c.examFlag === '0');
-        out.push({
-          id,
-          title: String(c.name || c.courseName || c.title).trim().slice(0, 60),
-          test: hasTest,
-          ch: Number(c.creditHour) || 0
-        });
-      }
+  function columnIdFromHash() {
+    const m = location.hash.match(/[?&]id=(\d{10,25})/);
+    return m ? m[1] : null;
+  }
+
+  // 优先用专栏接口的课；其次任何带“专栏课程”来源的；最后用全部
+  function pickPool() {
+    const all = [...courseMap.values()].sort((a, b) => a.seq - b.seq);
+    const colId = columnIdFromHash();
+    if (colId) {
+      const byCol = all.filter(x => x.col === colId);
+      if (byCol.length) return { pool: byCol, label: '专栏接口，专栏ID ' + colId };
     }
-    return out;
+    const byApi = all.filter(x => /subject\/queryCourse/.test(x.src));
+    if (byApi.length) return { pool: byApi, label: '专栏课程接口' };
+    return { pool: all, label: '页面全部课程' };
   }
 
   function findPager() {
@@ -138,37 +174,37 @@
     const columnHash = location.hash;
     st.items = []; st.idx = -1; save(); render();
 
-    setMsg('采集中…（读取页面接口数据）');
-    let items = harvestAll();
-    log('初次扫描：已捕获接口响应', netLog.length, '个，解析出课程', items.length, '门');
+    let picked = pickPool();
+    setMsg(`采集中… 已识别 ${courseMap.size} 门（${picked.label}）`);
+    log('初始：课程库', courseMap.size, '门，来源', picked.label);
 
-    // 没有课程就翻页/滚动触发新请求，最多 15 轮
+    // 数量不够就翻页/滚动触发新请求，最多 15 轮
     let pages = 0;
     while (pages < 15) {
-      setMsg(`采集中… 第 ${pages + 1} 轮，累计 ${items.length} 门`, '#0a7');
-      const before = items.length;
+      const before = picked.pool.length;
       const pager = findPager();
       if (pager) pager.dispatchEvent(new MouseEvent('click', { bubbles: true }));
       else window.scrollTo(0, document.body.scrollHeight);
       await wait(2400);
-      items = harvestAll();
-      log(`第 ${pages + 1} 轮：累计 ${items.length} 门`);
+      picked = pickPool();
+      setMsg(`采集中… 第 ${pages + 1} 轮，累计 ${picked.pool.length} 门`, '#0a7');
+      log(`第 ${pages + 1} 轮：累计 ${picked.pool.length} 门`);
       pages++;
-      if (items.length && items.length === before) break;   // 不再增长，停止
-      if (items.length >= 200) break;
+      if (picked.pool.length === before) break;
+      if (picked.pool.length >= 200) break;
     }
 
-    if (!items.length) {
-      setMsg('未从接口里解析到课程。点「诊断」把结果发我', '#c00');
-      log('⚠ 解析失败。已捕获响应：', netLog.map(n => n.url).slice(-10));
+    if (!picked.pool.length) {
+      setMsg('未解析到课程。点「诊断」把结果发我', '#c00');
+      log('⚠ 解析失败。课程库 0 门；已捕获响应：', netLog.map(n => n.url).slice(-10));
       return;
     }
 
-    st.items = items;
+    st.items = picked.pool.map(x => ({ id: x.id, title: x.title, ch: x.ch, test: x.test }));
     st.columnHash = columnHash;
     save(); render();
-    setMsg(`✅ 采集完成 ${items.length} 门`, '#0a7');
-    log(`采集完成：${items.length} 门（来自接口解析）`);
+    setMsg(`✅ 采集完成 ${st.items.length} 门（${picked.label}）`, '#0a7');
+    log(`采集完成：${st.items.length} 门，来源 ${picked.label}`);
   }
 
   // ================= 倍速 =================
@@ -295,10 +331,20 @@
   }
 
   function diag() {
-    const courseHits = harvestAll();
+    const all = [...courseMap.values()].sort((a, b) => a.seq - b.seq);
+    const picked = pickPool();
     const respWithCourse = netLog.filter(r => {
       const f = []; walk(r.json, f, 0); return f.length > 0;
     }).map(r => r.url);
+
+    // 按来源 / 专栏分组，便于判断列表是否混了别的课
+    const groups = {};
+    all.forEach(x => {
+      const k = x.col
+        ? 'col:' + x.col
+        : 'src:' + ((x.src.split('?')[0].replace(/^.*\/api\//, '') || 'other').slice(0, 40));
+      groups[k] = (groups[k] || 0) + 1;
+    });
 
     // DOM 兜底信息：找出页面上“看起来像列表”的容器
     const containers = [...document.querySelectorAll('[class*="list"],[class*="List"],[class*="item"],[class*="Item"]')]
@@ -318,8 +364,10 @@
       capturedResponses: netLog.length,
       capturedUrls: netLog.map(n => n.url).slice(-8),
       responsesWithCourses: respWithCourse.slice(-5),
-      parsedCourses: courseHits.length,
-      courseSample: courseHits.slice(0, 5),
+      courseStore: all.length,
+      courseGroups: groups,
+      willUse: { source: picked.label, count: picked.pool.length },
+      courseSample: picked.pool.slice(0, 5),
       hasPager: !!findPager(),
       rateControl: !!document.querySelector('.vjs-playback-rate'),
       controlBar: bar ? [...bar.children].map(c => String(c.className).slice(0, 40)) : null,
