@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         灯塔-干部网络学院 专栏播放列表
 // @namespace    local.gbwlxy
-// @version      3.3
+// @version      3.4
 // @description  拦截专栏页的课程接口生成播放列表，按顺序播放；1.5 倍速走平台控件；播完自动下一门；跳过随堂测试。
 // @match        https://gbwlxy.dtdjzx.gov.cn/*
 // @run-at       document-start
@@ -11,7 +11,7 @@
 (function () {
   'use strict';
 
-  const V = '3.3';
+  const V = '3.4';
   const KEY = 'gbwlxy_pl_v2';
   const RATE_KEY = 'gbwlxy_rate';
   const SS = window.sessionStorage;
@@ -29,6 +29,11 @@
     return [1, 1.25, 1.5].includes(n) ? n : 1.5;
   };
   let rate = getRate();
+
+  // 是否跳过“含随堂测试”的课（这类课播完也不计学时，默认跳过）
+  const SKIP_KEY = 'gbwlxy_skip_test';
+  const getSkip = () => { try { return SS.getItem(SKIP_KEY) !== '0'; } catch (e) { return true; } };
+  let skipTest = getSkip();
 
   const currentId = () => { const m = location.hash.match(/courseId=(\d{10,25})/); return m ? m[1] : null; };
   const onCoursePage = () => !!currentId();
@@ -262,13 +267,23 @@
     location.hash = `#/commend/coursedetail?courseId=${it.id}&flag=kc`;
   }
 
+  // 自动前进时跳过含测试的课（手动点击列表项不跳，尊重你的选择）
+  function skipOver(i) {
+    if (!skipTest) return i;
+    let k = i, n = 0;
+    while (k < st.items.length && st.items[k].test) { k++; n++; }
+    if (n) log(`跳过 ${n} 门含随堂测试的课（播完也不计学时）`);
+    return k;
+  }
+
   function nextItem() {
     if (!st.running) return;
-    if (st.idx + 1 >= st.items.length) {
+    const i = skipOver(st.idx + 1);
+    if (i >= st.items.length) {
       log('🎉 列表全部完成'); setMsg('🎉 全部完成', '#0a7');
       st.running = false; save(); render(); return;
     }
-    openItem(st.idx + 1);
+    openItem(i);
   }
 
   // ================= 结束 / 考试页 =================
@@ -313,8 +328,11 @@
   function render() {
     if (!panel) return;
     const cur = st.items[st.idx];
+    const testN = st.items.filter(x => x.test).length;
     panel.querySelector('.p-status').textContent =
-      `${st.items.length ? st.items.length + ' 门' : '空列表'} ｜${st.running ? '播放中' : '已停止'}` +
+      `${st.items.length ? st.items.length + ' 门' : '空列表'}` +
+      (testN ? `（${testN} 门含测试${skipTest ? '·跳过' : ''}）` : '') +
+      ` ｜${st.running ? '播放中' : '已停止'}` +
       (cur ? ` ｜${st.idx + 1}. ${cur.title.slice(0, 12)}` : '') + ` ｜${rate}x`;
     panel.querySelector('.p-start').textContent = st.running ? '停止' : '开始';
     const box = panel.querySelector('.p-list');
@@ -398,6 +416,7 @@
       '<div style="margin-top:6px">倍速 <select class="p-rate">' +
       [1, 1.25, 1.5].map(r => '<option value="' + r + '"' + (r === rate ? ' selected' : '') + '>' + r + 'x</option>').join('') +
       '</select><button class="p-clear" style="margin-left:6px">清空</button></div>' +
+      '<div style="margin-top:4px"><label><input type="checkbox" class="p-skip"' + (skipTest ? ' checked' : '') + '> 跳过含测试的课（播完不计学时）</label></div>' +
       '<textarea class="p-diag-out" readonly style="display:none;width:100%;height:90px;margin-top:6px;font:11px monospace"></textarea>' +
       '<div class="p-list" style="max-height:170px;overflow:auto;border-top:1px solid #eee;margin-top:6px;padding-top:4px"></div>';
     (document.body || document.documentElement).appendChild(panel);
@@ -406,13 +425,19 @@
     panel.querySelector('.p-start').onclick = () => {
       st.running = !st.running; save(); render();
       if (st.running) {
-        if (st.idx < 0) openItem(0);
+        if (st.idx < 0) openItem(skipOver(0));
         else if (video) playNow(video);
         else attach();
       }
       log(st.running ? '开始' : '停止');
     };
     panel.querySelector('.p-diag').onclick = diag;
+    panel.querySelector('.p-skip').onchange = (e) => {
+      skipTest = e.target.checked;
+      try { SS.setItem(SKIP_KEY, skipTest ? '1' : '0'); } catch (err) {}
+      log(skipTest ? '已开启：跳过含测试的课' : '已关闭：含测试的课也会播放');
+      render();
+    };
     panel.querySelector('.p-rate').onchange = (e) => {
       rate = Number(e.target.value);
       try { SS.setItem(RATE_KEY, String(rate)); } catch (err) {}
