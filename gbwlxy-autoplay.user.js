@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         灯塔-干部网络学院 专栏播放列表
 // @namespace    local.gbwlxy
-// @version      3.4
+// @version      3.5
 // @description  拦截专栏页的课程接口生成播放列表，按顺序播放；1.5 倍速走平台控件；播完自动下一门；跳过随堂测试。
 // @match        https://gbwlxy.dtdjzx.gov.cn/*
 // @run-at       document-start
@@ -11,7 +11,7 @@
 (function () {
   'use strict';
 
-  const V = '3.4';
+  const V = '3.5';
   const KEY = 'gbwlxy_pl_v2';
   const RATE_KEY = 'gbwlxy_rate';
   const SS = window.sessionStorage;
@@ -44,13 +44,15 @@
   const NET_MAX = 60;
 
   // 课程库：一旦在响应里识别到课程就立刻存下来，不参与淘汰，并按来源/专栏分组
-  const courseMap = new Map();     // id -> { id, title, ch, test, src, col, seq }
+  const courseMap = new Map();     // id -> { id, title, ch, test, at, src, col, seq }
   let seq = 0;
+  let lastColId = null;            // 最近一次见到的专栏 id，供课程页收集时兜底
 
   function pushNet(url, json, body) {
     if (netLog.length >= NET_MAX) netLog.shift();
     netLog.push({ url: String(url || '').slice(-100), json: json });
     indexJSON(url, json, body);
+    updateCurrentCourse(json);     // 课程详情响应可用来校正“是否含测试”
   }
 
   // 从请求体里取专栏 id（/subject/queryCourse 的 payload 带 subjectId）
@@ -71,6 +73,7 @@
     if (!found.length) return;
     const src = String(url || '');
     const col = columnIdFromBody(body);
+    if (col) lastColId = col;
     for (const c of found) {
       const id = String(c.id || c.courseId);
       if (courseMap.has(id)) continue;
@@ -81,10 +84,39 @@
         title: String(c.name || c.courseName || c.title).trim().slice(0, 60),
         ch: Number(c.creditHour) || 0,
         test: hasTest,
+        at: c.assessementType === undefined ? 'absent' : String(c.assessementType),
         src: src.slice(-70),
         col: col || null,
         seq: seq++
       });
+    }
+  }
+
+  // 课程详情接口（/course/web/get）带 assessementType，用来校正列表里判不出的“含测试”
+  function updateCurrentCourse(json) {
+    const cid = currentId();
+    if (!cid || !st.items.length) return;
+    const found = [];
+    walk(json, found, 0);
+    const e = found.find(x => String(x.id || x.courseId) === cid);
+    if (!e) return;
+    if (e.assessementType === undefined && e.examFlag === undefined) return;
+    const t = (e.assessementType !== undefined && e.assessementType !== null && String(e.assessementType) !== '1')
+      || e.examFlag === '0';
+    const ch = Number(e.creditHour) || 0;
+    const rec = courseMap.get(cid);
+    if (rec) { rec.test = t; rec.at = e.assessementType === undefined ? rec.at : String(e.assessementType); if (ch) rec.ch = ch; }
+
+    const it = st.items[st.idx];
+    if (!it || it.id !== cid) return;
+    const changed = it.test !== t;
+    it.test = t;
+    if (ch) it.ch = ch;
+    save(); render();
+    if (changed && t) log('📌 这门课实际含随堂测试（列表里没标出来）');
+    if (t && skipTest && video && video.currentTime < 25) {
+      log('⚠ 含随堂测试且刚开始播，立即跳过');
+      nextItem();
     }
   }
 
@@ -146,6 +178,10 @@
     if (colId) {
       const byCol = all.filter(x => x.col === colId);
       if (byCol.length) return { pool: byCol, label: '专栏接口，专栏ID ' + colId };
+    }
+    if (lastColId) {
+      const byLast = all.filter(x => x.col === lastColId);
+      if (byLast.length) return { pool: byLast, label: '专栏接口，最近专栏 ' + lastColId };
     }
     const byApi = all.filter(x => /subject\/queryCourse/.test(x.src));
     if (byApi.length) return { pool: byApi, label: '专栏课程接口' };
@@ -385,6 +421,11 @@
       courseStore: all.length,
       courseGroups: groups,
       willUse: { source: picked.label, count: picked.pool.length },
+      testFlag: {
+        markedTrue: picked.pool.filter(x => x.test).length,
+        fieldAbsent: picked.pool.filter(x => x.at === 'absent').length,
+        atValues: [...new Set(picked.pool.map(x => x.at))].slice(0, 6)
+      },
       courseSample: picked.pool.slice(0, 5),
       hasPager: !!findPager(),
       rateControl: !!document.querySelector('.vjs-playback-rate'),
