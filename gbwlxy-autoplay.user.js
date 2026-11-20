@@ -1,7 +1,7 @@
-﻿// ==UserScript==
+// ==UserScript==
 // @name         灯塔-干部网络学院 专栏播放列表
 // @namespace    local.gbwlxy
-// @version      3.6
+// @version      3.7
 // @description  拦截专栏页的课程接口生成播放列表，按顺序播放；1.5 倍速走平台控件；播完自动下一门；跳过随堂测试。
 // @match        https://gbwlxy.dtdjzx.gov.cn/*
 // @run-at       document-start
@@ -11,7 +11,7 @@
 (function () {
   'use strict';
 
-  const V = '3.6';
+  const V = '3.7';
   const KEY = 'gbwlxy_pl_v2';
   const RATE_KEY = 'gbwlxy_rate';
   const SS = window.sessionStorage;
@@ -174,11 +174,24 @@
   // 优先用专栏接口的课；其次任何带“专栏课程”来源的；最后用全部
   function pickPool() {
     const all = [...courseMap.values()].sort((a, b) => a.seq - b.seq);
+
+    // 1) 最精确：当前正在播的课程属于哪个专栏，就取那个专栏
+    const cid = currentId();
+    if (cid) {
+      const hit = all.find(x => x.id === cid);
+      if (hit && hit.col) {
+        const by = all.filter(x => x.col === hit.col);
+        if (by.length) return { pool: by, label: '当前课程所属专栏 ' + hit.col };
+      }
+    }
+
+    // 2) 页面 hash 里的专栏 id
     const colId = columnIdFromHash();
     if (colId) {
       const byCol = all.filter(x => x.col === colId);
       if (byCol.length) return { pool: byCol, label: '专栏接口，专栏ID ' + colId };
     }
+    // 3) 最近一次见到的专栏
     if (lastColId) {
       const byLast = all.filter(x => x.col === lastColId);
       if (byLast.length) return { pool: byLast, label: '专栏接口，最近专栏 ' + lastColId };
@@ -295,28 +308,61 @@
   }
 
   // ================= 播放 =================
-  let navTarget = null, navArrivedAt = 0, navTries = 0;
+  // 导航目标写在 sessionStorage 里，这样平台“整页刷新”后依然知道该去哪一门
+  const FIX_KEY = 'gbwlxy_fix';
+  let lastNavAt = 0;
 
   function navigateTo(id) {
     location.hash = `#/commend/coursedetail?courseId=${id}&flag=kc`;
   }
 
+  function bumpFix(id) {
+    const o = getSS(FIX_KEY, { id: '', n: 0 });
+    if (o.id !== id) { o.id = id; o.n = 0; }
+    o.n++;
+    setSS(FIX_KEY, o);
+    return o.n;
+  }
+
+  // 只要期望目标还在、且当前页面不符，就校正过去（跨刷新有效）
+  function ensureOnTarget(force) {
+    const want = st.expect;
+    if (!want || !st.running) return;
+    if (currentId() === want) {
+      st.expect = null; st.expectAt = 0; save();
+      setSS(FIX_KEY, { id: '', n: 0 });
+      log('✅ 已到达目标课程', String(st.idx + 1));
+      return;
+    }
+    if (!force && Date.now() - lastNavAt < 5000) return;
+    const n = bumpFix(want);
+    if (n > 10) {
+      log('⚠ 连续校正失败，停止');
+      st.running = false; st.expect = null; save(); render();
+      setMsg('跳转失败，已停止（把控制台日志发我）', '#c00');
+      return;
+    }
+    lastNavAt = Date.now();
+    log(`→ 校正导航到目标课程（第 ${n} 次）`);
+    navigateTo(want);
+  }
+
   function openItem(i) {
     const it = st.items[i];
     if (!it) { st.running = false; save(); render(); return; }
-    st.idx = i; save(); render();
+    st.idx = i;
+    st.expect = it.id;
+    st.expectAt = Date.now();
+    save(); render();
     log(`→ ${i + 1}/${st.items.length} ${it.title}`);
 
-    navTarget = it.id;
-    navTries = 0;
-    navArrivedAt = 0;
-    if (currentId() !== it.id) {
-      navigateTo(it.id);
-      // 平台播放器在结束/重载时也会改路由，再补一枪
-      setTimeout(() => { if (navTarget === it.id && currentId() !== it.id) navigateTo(it.id); }, 1600);
-    } else {
-      navArrivedAt = Date.now();
+    if (currentId() === it.id) {
+      st.expect = null; save();
+      return;
     }
+    navigateTo(it.id);
+    // 补一枪：平台在结束时也会改路由，避免被它覆盖
+    setTimeout(() => { if (st.expect === it.id && currentId() !== it.id) navigateTo(it.id); }, 1600);
   }
 
   // 自动前进时跳过含测试的课（手动点击列表项不跳，尊重你的选择）
@@ -368,25 +414,10 @@
     examHandled = false;
     if (pendingAdvance) { pendingAdvance = false; video = null; setTimeout(nextItem, 800); return; }
 
-    // 导航校验：跳过去之后要“稳住”一段时间；被平台自身跳转弹回去就重试
-    if (navTarget) {
-      if (currentId() === navTarget) {
-        if (!navArrivedAt) navArrivedAt = Date.now();
-        else if (Date.now() - navArrivedAt > 12000) { navTarget = null; navArrivedAt = 0; }   // 稳定 12 秒算成功
-      } else {
-        navArrivedAt = 0;
-        navTries++;
-        if (navTries % 2 === 1) {
-          log('⚠ 页面被弹回去了，重新导航到目标课程（第 ' + navTries + ' 次）');
-          navigateTo(navTarget);
-        }
-        if (navTries > 12) {
-          navTarget = null;
-          st.running = false; save(); render();
-          setMsg('跳转失败，已停止（把控制台日志发我）', '#c00');
-        }
-      }
-    }
+    // 导航校验：期望目标存在就校正（跨整页刷新依然有效）
+    ensureOnTarget(false);
+
+    if (!onCoursePage()) return;
 
     if (!onCoursePage()) return;
     attach();
@@ -536,9 +567,18 @@
       openItem: (i) => openItem(i),
       nextItem: () => nextItem(),
       state: () => JSON.parse(JSON.stringify(st)),
-      nav: () => ({ target: navTarget, arrivedAt: navArrivedAt, tries: navTries, current: currentId() })
+      nav: () => ({ expect: st.expect, idx: st.idx, current: currentId(), fix: getSS('gbwlxy_fix', null) })
     };
-    if (st.running && onCoursePage()) { log('恢复运行，继续播放'); attach(); }
+    // 平台播完可能整页刷新回原课程，这里开机就检查是否跑错了页
+    if (st.running) {
+      if (st.expect && currentId() !== st.expect) {
+        log('⚠ 页面课程与播放列表不一致（可能被平台刷新回原课），开始校正到第', st.idx + 1, '项');
+        setTimeout(() => ensureOnTarget(true), 600);
+      } else if (onCoursePage()) {
+        log('恢复运行，继续播放');
+        attach();
+      }
+    }
     let boot = 0;
     const t = setInterval(() => {
       if (!st.running || pendingAdvance || onExamRoute()) return;
